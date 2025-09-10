@@ -1,0 +1,47 @@
+name: Deploy Supabase
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD:  ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_REF:          ${{ secrets.SUPABASE_REF }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI (latest)
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Print Supabase env
+        run: |
+          echo "Project ref: $SUPABASE_REF"
+
+      # Link
+      - name: Link project
+        run: |
+          supabase link \
+            --project-ref "$SUPABASE_REF" \
+            --password    "$SUPABASE_DB_PASSWORD"
+
+      # Migrations
+      - name: Push migrations
+        run: |
+          supabase --dns-resolver=https db push \
+            --yes \
+            --include-all
+
+      # Deploy the single entry-point function
+      - name: Deploy `app` Edge Function (no-verify-jwt)
+        run: |
+          supabase functions deploy app \
+            --project-ref "$SUPABASE_REF" \
+            --no-verify-jwt
