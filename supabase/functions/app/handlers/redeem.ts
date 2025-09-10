@@ -7,7 +7,7 @@ function json(data: unknown, status = 200) {
     new Response(JSON.stringify(data), {
       status,
       headers: { "Content-Type": "application/json" },
-    })
+    }),
   );
 }
 
@@ -57,7 +57,11 @@ export async function handleRedeem(req: Request) {
     const rulePayload =
       reward.discount_type === "percentage"
         ? { value_type: "percentage", value: `-${reward.discount_value}` }
-        : { value_type: "fixed_amount", value: `-${reward.discount_value}`, allocation_method: "across" };
+        : {
+            value_type: "fixed_amount",
+            value: `-${reward.discount_value}`,
+            allocation_method: "across",
+          };
     priceRuleId = await createPriceRule(`${reward.name}`, rulePayload);
     await supa
       .from("rewards")
@@ -65,7 +69,7 @@ export async function handleRedeem(req: Request) {
       .eq("id", reward.id);
   }
 
-  // === Phase 1: begin (lock, checa saldo, debita pontos, cria pending redemption)
+  // === Phase 1: begin
   const begin = await supa.rpc("redeem_begin", {
     p_member_id: member.id,
     p_reward_id: reward.id,
@@ -93,8 +97,8 @@ export async function handleRedeem(req: Request) {
     }
 
     return json({ code }, 200);
-  } catch {
+  } catch (err) {
     await supa.rpc("redeem_cancel", { p_redemption_id: redemption_id }).catch(() => {});
-    return json({ error: "Discount creation failed" }, 502);
+    return json({ error: `Discount creation failed: ${(err as Error).message}` }, 502);
   }
 }

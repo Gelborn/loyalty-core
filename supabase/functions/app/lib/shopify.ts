@@ -1,11 +1,84 @@
 const SHOP_DOMAIN = Deno.env.get("SHOP_DOMAIN")!;
 const ADMIN_TOKEN = Deno.env.get("SHOPIFY_ADMIN_TOKEN")!;
 
-export async function createPriceRule(title: string, rulePayload: Record<string, unknown>) {
-  const resp = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-10/price_rules.json`, {
+// ---------- utils
+
+function log(event: string, data: Record<string, unknown> = {}) {
+  console.log(JSON.stringify({ src: "shopify", event, ...data }));
+}
+
+function asNegString(n: number): string {
+  // Shopify espera valor negativo como string ("-10.0")
+  const num = Number(n);
+  return (num > 0 ? -num : num).toFixed(2);
+}
+
+async function readBodySafe(resp: Response) {
+  const text = await resp.text();
+  try {
+    return { text, json: JSON.parse(text) };
+  } catch {
+    return { text, json: null as unknown };
+  }
+}
+
+async function shopifyFetch(
+  path: string,
+  init: RequestInit & { json?: unknown } = {},
+): Promise<{ parsed: any; rawText: string }> {
+  const url = `https://${SHOP_DOMAIN}/admin/api/2024-10/${path.replace(/^\/+/, "")}`;
+  const { json, ...rest } = init;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Shopify-Access-Token": ADMIN_TOKEN,
+    ...(init.headers as Record<string, string> | undefined),
+  };
+
+  const body = json !== undefined ? JSON.stringify(json) : init.body;
+
+  log("request", {
+    method: (rest.method || "GET").toUpperCase(),
+    url,
+    hasBody: Boolean(body),
+    bodyPreview: body ? String(body).slice(0, 500) : undefined,
+  });
+
+  const resp = await fetch(url, { ...rest, headers, body });
+  const { text, json: parsed } = await readBodySafe(resp);
+
+  log("response", {
+    url,
+    status: resp.status,
+    ok: resp.ok,
+    bodyPreview: text.slice(0, 800),
+  });
+
+  if (!resp.ok) {
+    const message =
+      (parsed as any)?.errors ??
+      (parsed as any)?.error ??
+      text ||
+      `HTTP ${resp.status}`;
+    const err = new Error(
+      typeof message === "string" ? message : JSON.stringify(message),
+    );
+    (err as any).status = resp.status;
+    throw err;
+  }
+
+  return { parsed, rawText: text };
+}
+
+// ---------- public API
+
+export async function createPriceRule(
+  title: string,
+  rulePayload: Record<string, unknown>,
+): Promise<string> {
+  const resp = await shopifyFetch("price_rules.json", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": ADMIN_TOKEN },
-    body: JSON.stringify({
+    json: {
       price_rule: {
         title,
         target_type: "line_item",
@@ -13,21 +86,20 @@ export async function createPriceRule(title: string, rulePayload: Record<string,
         allocation_method: "across",
         customer_selection: "all",
         starts_at: new Date().toISOString(),
-        usage_limit: null, // unlimited for the rule; each code can still be single-use
-        ...rulePayload
-      }
-    }),
+        usage_limit: null,
+        once_per_customer: false,
+        ...rulePayload,
+      },
+    },
   });
-  if (!resp.ok) throw new Error("Price rule failed");
-  const j = await resp.json();
-  return j?.price_rule?.id as string;
+  const id = resp.parsed?.price_rule?.id;
+  if (!id) throw new Error("Price rule creation returned no id");
+  return String(id);
 }
 
-export async function createDiscountCode(priceRuleId: string, code: string) {
-  const resp = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-10/price_rules/${priceRuleId}/discount_codes.json`, {
+export async function createDiscountCode(priceRuleId: string | number, code: string): Promise<void> {
+  await shopifyFetch(`price_rules/${priceRuleId}/discount_codes.json`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": ADMIN_TOKEN },
-    body: JSON.stringify({ discount_code: { code } }),
+    json: { discount_code: { code } },
   });
-  if (!resp.ok) throw new Error("Discount code failed");
 }
