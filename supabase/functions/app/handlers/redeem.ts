@@ -24,6 +24,7 @@ export async function handleRedeem(req: Request) {
   const user = await getUserFromJWT(token);
   if (!user) return json({ error: "Unauthorized" }, 401, origin);
 
+  // Body
   const body = await req.json().catch(() => ({}));
   const reward_id = String(body.reward_id || "");
   if (!reward_id) return json({ error: "Missing reward_id" }, 400, origin);
@@ -45,10 +46,10 @@ export async function handleRedeem(req: Request) {
     .single();
   if (rErr || !reward) return json({ error: "Invalid reward" }, 400, origin);
 
-  // Balance check
+  // (Optional fast path) show current balance; the real check happens inside redeem_begin
   const { data: bal } = await balanceFor(member.id);
-  const points = (bal?.points || 0) as number;
-  if (points < reward.cost_points) return json({ error: "Not enough points" }, 400, origin);
+  if ((bal?.points || 0) < reward.cost_points)
+    return json({ error: "Not enough points" }, 400, origin);
 
   // Ensure (or create) price rule once per reward
   let priceRuleId = reward.shopify_price_rule_id as string | null;
@@ -57,32 +58,43 @@ export async function handleRedeem(req: Request) {
       reward.discount_type === "percentage"
         ? { value_type: "percentage", value: `-${reward.discount_value}` }
         : { value_type: "fixed_amount", value: `-${reward.discount_value}`, allocation_method: "across" };
-
     priceRuleId = await createPriceRule(`${reward.name}`, rulePayload);
     await supa.from("rewards")
       .update({ shopify_price_rule_id: String(priceRuleId) })
       .eq("id", reward.id);
   }
 
-  // Create a single-use code under the reusable rule
+  // === Phase 1: begin DB transaction (locks member, verifies balance, deducts points, creates pending redemption)
+  const begin = await supa.rpc("redeem_begin", {
+    p_member_id: member.id,
+    p_reward_id: reward.id,
+  });
+  if (begin.error) return json({ error: begin.error.message }, 400, origin);
+  const row = (begin.data || [])[0];
+  const redemption_id: string | undefined = row?.redemption_id;
+  if (!redemption_id) return json({ error: "Redeem begin failed" }, 500, origin);
+
+  // === External call: create single-use code under reusable rule
   const code = `LOYAL-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-  await createDiscountCode(priceRuleId!, code);
+  try {
+    await createDiscountCode(priceRuleId!, code);
 
-  // Deduct points and record redemption
-  const led = await supa.from("points_ledger").insert({
-    member_id: member.id,
-    delta_points: -reward.cost_points,
-    reason: `redeem:${code}`,
-    meta: { reward_id }
-  });
-  if (led.error) return json({ error: led.error.message }, 500, origin);
+    // === Phase 2 (commit): mark issued + record code + rule id
+    const commit = await supa.rpc("redeem_commit", {
+      p_redemption_id: redemption_id,
+      p_discount_code: code,
+      p_price_rule_id: String(priceRuleId),
+    });
+    if (commit.error) {
+      // best-effort compensation
+      await supa.rpc("redeem_cancel", { p_redemption_id: redemption_id });
+      return json({ error: "Commit failed" }, 500, origin);
+    }
 
-  await supa.from("redemptions").insert({
-    member_id: member.id,
-    reward_id,
-    discount_code: code,
-    shopify_price_rule_id: String(priceRuleId)
-  });
-
-  return json({ code }, 200, origin);
+    return json({ code }, 200, origin);
+  } catch (e) {
+    // compensation: restore points & cancel redemption
+    await supa.rpc("redeem_cancel", { p_redemption_id: redemption_id }).catch(() => {});
+    return json({ error: "Discount creation failed" }, 502, origin);
+  }
 }
