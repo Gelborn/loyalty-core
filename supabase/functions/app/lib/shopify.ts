@@ -55,11 +55,13 @@ async function shopifyFetch(
   });
 
   if (!resp.ok) {
-    const message =
-      (parsed as any)?.errors ??
-      (parsed as any)?.error ??
-      text ||
-      `HTTP ${resp.status}`;
+    // 👇 Parentetizado para evitar erro de precedência no Deno v2
+    const primary =
+      (parsed as any)?.errors ?? (parsed as any)?.error ?? text;
+    const message = (primary && String(primary).trim().length > 0)
+      ? primary
+      : `HTTP ${resp.status}`;
+
     const err = new Error(
       typeof message === "string" ? message : JSON.stringify(message),
     );
@@ -76,7 +78,15 @@ export async function createPriceRule(
   title: string,
   rulePayload: Record<string, unknown>,
 ): Promise<string> {
-  const resp = await shopifyFetch("price_rules.json", {
+  // Normaliza valor negativo quando vier nesses campos
+  const rp: Record<string, unknown> = { ...rulePayload };
+  if (typeof rp.value === "number") rp.value = asNegString(rp.value as number);
+  if (typeof rp.value === "string") {
+    const n = Number(rp.value);
+    if (!Number.isNaN(n)) rp.value = asNegString(n);
+  }
+
+  const { parsed } = await shopifyFetch("price_rules.json", {
     method: "POST",
     json: {
       price_rule: {
@@ -88,11 +98,12 @@ export async function createPriceRule(
         starts_at: new Date().toISOString(),
         usage_limit: null,
         once_per_customer: false,
-        ...rulePayload,
+        ...rp,
       },
     },
   });
-  const id = resp.parsed?.price_rule?.id;
+
+  const id = parsed?.price_rule?.id;
   if (!id) throw new Error("Price rule creation returned no id");
   return String(id);
 }

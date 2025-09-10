@@ -62,7 +62,9 @@ export async function handleRedeem(req: Request) {
             value: `-${reward.discount_value}`,
             allocation_method: "across",
           };
+
     priceRuleId = await createPriceRule(`${reward.name}`, rulePayload);
+
     await supa
       .from("rewards")
       .update({ shopify_price_rule_id: String(priceRuleId) })
