@@ -52,6 +52,15 @@ export async function handleWebhooks(req: Request) {
     return new Response("Bad JSON", { status: 400 });
   }
 
+  // log the payload
+  const payloadStr = JSON.stringify(payload);
+  log("payload.raw", {
+    topic,
+    deliveryId,
+    len: payloadStr.length,
+    preview: payloadStr.slice(0, 500) // avoid logging megabytes; trim after 500 chars
+  });
+
   const email = (payload?.email || payload?.customer?.email || "").toLowerCase();
   log("payload.parsed", {
     topic,
