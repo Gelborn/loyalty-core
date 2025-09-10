@@ -4,17 +4,13 @@ import { verifyShopifyWebhook } from "../lib/crypto.ts";
 const API_SECRET = Deno.env.get("SHOPIFY_API_SECRET")!;
 const SHOP_DOMAIN = (Deno.env.get("SHOP_DOMAIN") || "").toLowerCase();
 
-// Require POINTS_MULTIPLIER secret
+// Require POINTS_MULTIPLIER secret (no fallback)
 const pmRaw = Deno.env.get("POINTS_MULTIPLIER");
-if (!pmRaw) {
-  throw new Error("Missing required secret: POINTS_MULTIPLIER");
-}
+if (!pmRaw) throw new Error("Missing required secret: POINTS_MULTIPLIER");
 const POINTS_MULTIPLIER = Number(pmRaw);
 if (!Number.isFinite(POINTS_MULTIPLIER) || POINTS_MULTIPLIER <= 0) {
   throw new Error("Invalid POINTS_MULTIPLIER: must be a positive number");
 }
-
-// Log multiplier once at boot
 console.log(JSON.stringify({ src: "webhooks", event: "config", POINTS_MULTIPLIER }));
 
 function isFinalPaidOrder(payload: any) {
@@ -34,20 +30,17 @@ async function computeRefundPoints(payload: any): Promise<number> {
     const n = Math.floor(Math.abs(Number(totalSet) || 0));
     if (n > 0) return n;
   }
-
   const txs = Array.isArray(payload?.transactions) ? payload.transactions : [];
   const txSum = txs
     .filter((t: any) => String(t?.kind).toLowerCase() === "refund")
     .reduce((acc: number, t: any) => acc + Math.abs(Number(t?.amount || 0)), 0);
   if (txSum > 0) return Math.floor(txSum);
-
   const items = Array.isArray(payload?.refund_line_items) ? payload.refund_line_items : [];
   const itemSum = items.reduce((acc: number, it: any) => {
     const q = Number(it?.quantity || 0);
     const price = Number(it?.line_item?.price || 0);
     return acc + q * price;
   }, 0);
-
   return Math.floor(Math.abs(itemSum));
 }
 
@@ -106,7 +99,9 @@ export async function handleWebhooks(req: Request) {
         return new Response("ok", { status: 200 });
       }
 
+      // STRICT: decide only by loyalty_members(email). If missing, create new Auth user + member.
       const { member } = await getOrCreateMemberWithUser(email);
+
       const rawAmount = Number(payload?.total_price) || 0;
       const amount = Math.floor(rawAmount * POINTS_MULTIPLIER);
       const reason = `order:${payload.id}`;
@@ -139,25 +134,22 @@ export async function handleWebhooks(req: Request) {
         return new Response("ok", { status: 200 });
       }
 
-      let memberId: string | null = null;
-      {
-        const { data: credited, error } = await supa
-          .from("points_ledger")
-          .select("member_id")
-          .eq("reason", `order:${orderId}`)
-          .limit(1)
-          .maybeSingle();
-
-        if (error) {
-          log("refunds.lookup_error", { err: error.message, orderId, deliveryId });
-          return new Response("Lookup error", { status: 500 });
-        }
-
-        memberId = credited?.member_id ?? null;
-        log("refunds.resolve", { orderId, memberIdFound: Boolean(memberId) });
+      // Resolve member from the original credited order in our ledger
+      const { data: credited, error: lookErr } = await supa
+        .from("points_ledger")
+        .select("member_id")
+        .eq("reason", `order:${orderId}`)
+        .limit(1)
+        .maybeSingle();
+      if (lookErr) {
+        log("refunds.lookup_error", { err: lookErr.message, orderId, deliveryId });
+        return new Response("Lookup error", { status: 500 });
       }
+      const memberId = credited?.member_id ?? null;
+      log("refunds.resolve", { orderId, memberIdFound: Boolean(memberId) });
 
       if (!memberId) {
+        // if order was never credited in our system, no points to remove
         log("refunds.skip.cannot_resolve_member", { orderId, deliveryId });
         return new Response("ok", { status: 200 });
       }
