@@ -4,6 +4,19 @@ import { verifyShopifyWebhook } from "../lib/crypto.ts";
 const API_SECRET = Deno.env.get("SHOPIFY_API_SECRET")!;
 const SHOP_DOMAIN = (Deno.env.get("SHOP_DOMAIN") || "").toLowerCase();
 
+// Require POINTS_MULTIPLIER secret
+const pmRaw = Deno.env.get("POINTS_MULTIPLIER");
+if (!pmRaw) {
+  throw new Error("Missing required secret: POINTS_MULTIPLIER");
+}
+const POINTS_MULTIPLIER = Number(pmRaw);
+if (!Number.isFinite(POINTS_MULTIPLIER) || POINTS_MULTIPLIER <= 0) {
+  throw new Error("Invalid POINTS_MULTIPLIER: must be a positive number");
+}
+
+// Log multiplier once at boot
+console.log(JSON.stringify({ src: "webhooks", event: "config", POINTS_MULTIPLIER }));
+
 function isFinalPaidOrder(payload: any) {
   const financial = (payload?.financial_status || "").toLowerCase();
   const cancelled = payload?.cancelled_at != null;
@@ -16,21 +29,18 @@ function log(event: string, data: Record<string, unknown> = {}) {
 
 /** Compute refund points using fields Shopify may send; supports partial refunds. */
 async function computeRefundPoints(payload: any): Promise<number> {
-  // 1) Prefer totals if present (varies by version / shop settings)
   const totalSet = payload?.total_refund_set?.shop_money?.amount ?? payload?.total_refund ?? null;
   if (totalSet != null) {
     const n = Math.floor(Math.abs(Number(totalSet) || 0));
     if (n > 0) return n;
   }
 
-  // 2) Sum refund transactions (kind === "refund")
   const txs = Array.isArray(payload?.transactions) ? payload.transactions : [];
   const txSum = txs
     .filter((t: any) => String(t?.kind).toLowerCase() === "refund")
     .reduce((acc: number, t: any) => acc + Math.abs(Number(t?.amount || 0)), 0);
   if (txSum > 0) return Math.floor(txSum);
 
-  // 3) Fallback: sum refund line items (quantity * price)
   const items = Array.isArray(payload?.refund_line_items) ? payload.refund_line_items : [];
   const itemSum = items.reduce((acc: number, it: any) => {
     const q = Number(it?.quantity || 0);
@@ -49,20 +59,17 @@ export async function handleWebhooks(req: Request) {
 
   log("request.received", { topic, shopHeader, deliveryId, hasHmac: Boolean(hmacHeader) });
 
-  // 1) Verify shop domain
   if (shopHeader !== SHOP_DOMAIN) {
     log("reject.unknown_shop", { expected: SHOP_DOMAIN, got: shopHeader });
     return new Response("Unknown shop", { status: 401 });
   }
 
-  // 2) Verify HMAC using RAW body
   const { ok, raw } = await verifyShopifyWebhook(req, API_SECRET);
   if (!ok) {
     log("reject.invalid_hmac", { deliveryId, hmacPrefix: hmacHeader.slice(0, 8) });
     return new Response("Invalid HMAC", { status: 401 });
   }
 
-  // 3) Parse payload
   let payload: any = {};
   try {
     payload = JSON.parse(new TextDecoder().decode(raw));
@@ -71,7 +78,6 @@ export async function handleWebhooks(req: Request) {
     return new Response("Bad JSON", { status: 400 });
   }
 
-  // Log payload preview
   const payloadStr = JSON.stringify(payload);
   log("payload.raw", { topic, deliveryId, len: payloadStr.length, preview: payloadStr.slice(0, 500) });
 
@@ -101,7 +107,8 @@ export async function handleWebhooks(req: Request) {
       }
 
       const { member } = await getOrCreateMemberWithUser(email);
-      const amount = Math.floor(Number(payload?.total_price) || 0);
+      const rawAmount = Number(payload?.total_price) || 0;
+      const amount = Math.floor(rawAmount * POINTS_MULTIPLIER);
       const reason = `order:${payload.id}`;
 
       if (amount > 0) {
@@ -119,7 +126,7 @@ export async function handleWebhooks(req: Request) {
             return new Response("Insert error", { status: 500 });
           }
         } else {
-          log("orders.credited", { member_id: member.id, amount, reason });
+          log("orders.credited", { member_id: member.id, rawAmount, amount, reason });
         }
       } else {
         log("orders.skip.zero_amount", { orderId: payload?.id });
@@ -132,7 +139,6 @@ export async function handleWebhooks(req: Request) {
         return new Response("ok", { status: 200 });
       }
 
-      // Resolve member by finding the original credited order in our ledger
       let memberId: string | null = null;
       {
         const { data: credited, error } = await supa
@@ -152,14 +158,12 @@ export async function handleWebhooks(req: Request) {
       }
 
       if (!memberId) {
-        // If we cannot map this refund to a credited order in our system, ignore safely.
-        // (No points were ever credited, so nothing to debit.)
         log("refunds.skip.cannot_resolve_member", { orderId, deliveryId });
         return new Response("ok", { status: 200 });
       }
 
-      // Compute refund amount (supports partials)
-      const amount = await computeRefundPoints(payload);
+      const rawRefund = await computeRefundPoints(payload);
+      const amount = Math.floor(rawRefund * POINTS_MULTIPLIER);
       const reason = `refund:${payload.id}`;
 
       if (amount > 0) {
@@ -177,7 +181,7 @@ export async function handleWebhooks(req: Request) {
             return new Response("Insert error", { status: 500 });
           }
         } else {
-          log("refunds.debited", { member_id: memberId, amount, reason });
+          log("refunds.debited", { member_id: memberId, rawRefund, amount, reason });
         }
       } else {
         log("refunds.skip.zero_amount", { refundId: payload?.id, orderId });
