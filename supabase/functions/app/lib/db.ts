@@ -19,8 +19,8 @@ async function adminGetUserByEmail(email: string) {
   if (!resp.ok) {
     throw new Error(`getUserByEmail failed: ${resp.status} ${await resp.text()}`);
   }
-  const json = await resp.json() as any;
-  const arr = Array.isArray(json) ? json : (json?.users ?? []);
+  const json = (await resp.json()) as any;
+  const arr = Array.isArray(json) ? json : json?.users ?? [];
   return (arr[0] ?? null) as { id: string; email?: string } | null;
 }
 
@@ -44,59 +44,121 @@ async function adminCreateConfirmedUser(email: string) {
 
 /**
  * Ensure a confirmed Auth user and a loyalty_member row for the email.
- * - If Auth user doesn't exist -> create (email confirmed)
- * - If member doesn't exist -> insert with user_id
+ * Race-safe across concurrent webhooks:
+ * - Ensures (or creates) Auth user
+ * - Prefers lookup by user_id (canonical)
+ * - Attaches user_id to existing email row if needed
+ * - Inserts if truly new, with retry on unique constraint
  * Returns { userId, member }
  */
 export async function getOrCreateMemberWithUser(emailRaw: string) {
   const email = emailRaw.toLowerCase();
 
-  // 1) Look up existing member first (fast-path)
-  const { data: existingMember, error: exErr } = await supa
-    .from("loyalty_members")
-    .select("*")
-    .eq("email", email)
-    .limit(1)
-    .maybeSingle();
-  if (exErr) throw new Error(exErr.message || "Failed to query loyalty_members");
-
-  let userId: string | undefined = existingMember?.user_id;
-
-  // 2) Ensure Auth user exists (via Admin REST)
+  // 1) ensure we have an auth user id
+  let userId: string | null = null;
+  const found = await adminGetUserByEmail(email);
+  userId = found?.id ?? null;
   if (!userId) {
-    const found = await adminGetUserByEmail(email);
-    if (found?.id) {
-      userId = found.id;
-    } else {
-      const created = await adminCreateConfirmedUser(email);
-      userId = created.id;
+    const created = await adminCreateConfirmedUser(email);
+    userId = created.id;
+  }
+
+  // 2) authoritative: lookup by user_id first (handles concurrent inserts)
+  {
+    const { data: byUser, error } = await supa
+      .from("loyalty_members")
+      .select("*")
+      .eq("user_id", userId)
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(error.message || "Failed to query loyalty_members by user_id");
+
+    if (byUser) {
+      // best-effort email sync (ignore if unique conflict)
+      if (byUser.email !== email) {
+        const upd = await supa
+          .from("loyalty_members")
+          .update({ email })
+          .eq("id", byUser.id)
+          .select("*")
+          .single();
+        if (!upd.error) return { userId, member: upd.data };
+      }
+      return { userId, member: byUser };
     }
   }
 
-  // 3) Ensure member exists with user_id
-  if (!existingMember) {
+  // 3) if none by user_id, see if we already have a row for this email
+  {
+    const { data: byEmail, error } = await supa
+      .from("loyalty_members")
+      .select("*")
+      .eq("email", email)
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(error.message || "Failed to query loyalty_members by email");
+
+    if (byEmail) {
+      // attach user_id if missing
+      if (!byEmail.user_id) {
+        const upd = await supa
+          .from("loyalty_members")
+          .update({ user_id: userId })
+          .eq("id", byEmail.id)
+          .select("*")
+          .single();
+        if (upd.error) throw new Error(upd.error.message);
+        return { userId, member: upd.data };
+      }
+      // row already linked to some user_id; return it
+      return { userId: byEmail.user_id as string, member: byEmail };
+    }
+  }
+
+  // 4) truly new → insert; handle race with retry on unique violation
+  try {
     const ins = await supa
       .from("loyalty_members")
       .insert({ email, user_id: userId })
       .select("*")
       .single();
-    if (ins.error) throw new Error(ins.error.message);
-    return { userId: userId!, member: ins.data };
+    if (ins.error) throw ins.error;
+    return { userId, member: ins.data };
+  } catch (e: any) {
+    const code = e?.code || "";
+    const msg = String(e?.message || "");
+    if (code === "23505" || msg.includes("duplicate key value")) {
+      // someone else inserted; read by user_id now
+      const { data: byUser, error } = await supa
+        .from("loyalty_members")
+        .select("*")
+        .eq("user_id", userId)
+        .limit(1)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      if (byUser) {
+        if (byUser.email !== email) {
+          const upd = await supa
+            .from("loyalty_members")
+            .update({ email })
+            .eq("id", byUser.id)
+            .select("*")
+            .single();
+          if (!upd.error) return { userId, member: upd.data };
+        }
+        return { userId, member: byUser };
+      }
+      // fallback: read by email if that was the conflicting key
+      const { data: byEmail } = await supa
+        .from("loyalty_members")
+        .select("*")
+        .eq("email", email)
+        .limit(1)
+        .maybeSingle();
+      if (byEmail) return { userId: byEmail.user_id as string ?? userId!, member: byEmail };
+    }
+    throw e;
   }
-
-  // 4) Backfill user_id on existing member if needed
-  if (!existingMember.user_id && userId) {
-    const upd = await supa
-      .from("loyalty_members")
-      .update({ user_id: userId })
-      .eq("id", existingMember.id)
-      .select("*")
-      .single();
-    if (upd.error) throw new Error(upd.error.message);
-    return { userId: userId!, member: upd.data };
-  }
-
-  return { userId: userId!, member: { ...existingMember, user_id: userId } };
 }
 
 /** Verify a JWT and return its user (editor-only check; not used for writes) */
