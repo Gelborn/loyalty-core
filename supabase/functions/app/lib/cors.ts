@@ -14,9 +14,10 @@ export function corsHeaders(origin: string | null) {
   return {
     ...(allowed ? { "Access-Control-Allow-Origin": allowed } : {}),
     "Vary": "Origin",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "Authorization, Content-Type, x-client-info, apikey",
     "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Headers": "authorization, content-type",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   };
 }
 
